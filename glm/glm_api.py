@@ -178,6 +178,10 @@ async def lifespan(app):
         draft_model=draft_model, draft_cache=draft_cache,
         num_draft_tokens=args.num_draft_tokens, max_batch_size=1,
         max_chunk_size=2048, recurrent_checkpoint_interval=2048)
+    if dflash and getattr(args, "dflash_prefix_cache", False):
+        from glm_dflash_prefix import enable_prefix_cache
+        enable_prefix_cache(runtime["generator"].generator)
+        print("GLM DFlash2: previous-request prefix cache enabled (paired host snapshots)", flush=True)
     print(f"GLM ready: http://0.0.0.0:{args.port}/v1 · context {runtime['context_length']} "
           f"· cache {args.cache_size}", flush=True)
     try:
@@ -221,6 +225,7 @@ async def health():
               and not getattr(runtime["args"], "mtp", False))
     generator = getattr(runtime["generator"], "generator", runtime["generator"])
     draft_cache = getattr(generator, "draft_cache", None)
+    prefix_cache = getattr(generator, "_glm_dflash_prefix_cache", None)
     return {"status": "ok", "engine": "ExLlamaV3", "model": MODEL_ID, "context_length": runtime["context_length"],
             "cache_tokens": runtime["args"].cache_size,
             "cache_format": cache_format(),
@@ -233,7 +238,8 @@ async def health():
             "speculative_method": "dflash2" if dflash else "mtp",
             "draft_num_tokens": getattr(runtime["args"], "num_draft_tokens", None) or 2,
             "draft_ring_tokens": getattr(draft_cache, "dflash_ring_tokens", None),
-            "prompt_cache_reuse": not dflash,
+            "prompt_cache_reuse": not dflash or prefix_cache is not None,
+            "prompt_cache": prefix_cache.stats() if prefix_cache is not None else None,
             "busy": runtime["lock"].locked(),
             "generation_defaults": GENERATION_DEFAULTS}
 
@@ -390,8 +396,10 @@ async def complete(body, request, chat):
                                            ("time_enqueued", "queue_ms")]:
                         if result.get(native) is not None:
                             timings[public] = result[native] * 1000
+                    cached_tokens = min(prompt_tokens, max(0, int(result.get("cached_tokens", 0))))
+                    usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
                     timings.update(prompt_n=prompt_tokens, predicted_n=usage["completion_tokens"],
-                                   source="exllamav3", cached_tokens=result.get("cached_tokens", 0))
+                                   source="exllamav3", cached_tokens=cached_tokens, cache_n=cached_tokens)
                     if result.get("accepted_draft_tokens") is not None:
                         accepted = result["accepted_draft_tokens"]
                         drafted = accepted + result.get("rejected_draft_tokens", 0)
@@ -470,12 +478,16 @@ if __name__ == "__main__":
                         help="Keep the output projection resident on GPU 0")
     parser.add_argument("--fp16-draft-cache", action="store_true",
                         help="Keep the MTP draft layer cache FP16")
+    parser.add_argument("--dflash-prefix-cache", action="store_true",
+                        help="Opt in to previous-request DFlash prefix reuse with paired host snapshots")
     args = parser.parse_args()
     if not ((args.mtp and not args.draft_model_dir and args.num_draft_tokens == 2)
             or (not args.mtp and args.draft_model_dir and args.num_draft_tokens == 7)):
         parser.error("Use either --mtp -ndt 2 or -dm <DFlash2 EXL3 6bpw> -ndt 7")
     if (args.q8_staging or args.q8_head_gpu0 or args.fp16_draft_cache) and args.cache_quant != "8":
         parser.error("Q8 memory options require -cq 8")
+    if args.dflash_prefix_cache and args.mtp:
+        parser.error("--dflash-prefix-cache requires DFlash2; MTP already uses native prefix caching")
     if args.q8_staging and args.autosplit_max_batch_size != 1:
         parser.error("--q8-staging requires --autosplit_max_batch_size 1")
     runtime["args"] = args

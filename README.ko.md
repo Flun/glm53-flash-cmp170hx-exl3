@@ -18,6 +18,7 @@ P2P 미지원 64GB GPU 두 장(CMP 170HX 등)에서 **GLM-5.3-Flash**를
 | GLM 도구 호출 변환 | `glm/glm_tools.py` | GLM 네이티브 XML 도구 호출 → OpenAI `tool_calls` |
 | mHC fused 디코드 커널 | `kernels/k_hcfuse.py` | 0xSero k_hcfuse, ExLlamaV3 1.5.4 호환 |
 | DFlash2 BF16 → EXL3 6bpw 변환 | `dflash2/convert_drafter.py`, `dflash2/package_native.py` | 36개 선형층 6bit, drafter 약 0.96 GiB |
+| 이전 요청 프리픽스 재사용 | `glm/glm_dflash_prefix.py` | 반복 프롬프트 캐시 히트, `serve.sh` 기본 켜짐 |
 | 설치/서빙 런처 | `scripts/setup.sh`, `scripts/serve.sh` | 첫 실행에 Hugging Face에서 자동 다운로드 |
 
 미포함(범위 밖): 실험 캠페인의 벤치마크 하네스와 원시 측정 데이터, 그리고 이
@@ -84,13 +85,15 @@ curl http://127.0.0.1:8012/v1/chat/completions \
 - `POST /v1/chat/completions`, `POST /v1/completions`, SSE 스트리밍
 - 생각 과정은 `reasoning_content`, 답변은 `content`
 - OpenAI `tools` / `tool_choice` / `role: tool` 메시지 지원
-- `GET /health`가 캐시 정밀도, 컨텍스트, 추측 모드, draft 링 크기를 보고
+- `GET /health`가 캐시 정밀도, 컨텍스트, 추측 모드, draft 링 크기와 프리픽스 캐시
+  통계(`prompt_cache`: hits/misses/복원 토큰)를 보고
 - `GET /v1/models`가 실행 중 컨텍스트 상한을 보고
 - 기본값: `reasoning_effort=high`, `temperature=1.0`, `top_p=0.95`,
   `max_tokens=32768`. 요청은 하나씩 실행되고 나머지는 최대 120초 대기.
 - `timings`에 ExLlamaV3 native `prompt_ms` / `predicted_ms`와 draft
-  accepted/rejected 수를 노출해서, SSE 도착 시각 대신 실제 생성 시간 기준으로
-  PP/TG/수락률을 클라이언트에서 측정할 수 있습니다.
+  accepted/rejected 수, `cached_tokens`(`usage.prompt_tokens_details.cached_tokens`
+  에도 포함)를 노출해서, SSE 도착 시각 대신 실제 생성 시간 기준으로
+  PP/TG/수락률과 캐시 히트를 클라이언트에서 측정할 수 있습니다.
 
 ## 메모리 예산의 동작 방식
 
@@ -142,9 +145,22 @@ drafter 가중치 약 0.96 GiB.
   보호됩니다.
 - Q8 staging은 packed-pool gather 복사를 32K 토큰 타일로 제한하고 양자화 append
   작업공간을 GPU당 두 개 고정 버퍼로 묶어, 반복 요청에서 VRAM이 누적되지 않게 합니다.
-- DFlash2 모드에서는 프롬프트 KV 재사용이 비활성화됩니다: drafter 링에는 이전
-  요청의 스냅샷이 없어 매 요청 프리필을 다시 수행합니다. warm 프리필 처리량과
-  재사용으로 얻는 시간 절약은 별개 지표입니다.
+- DFlash2 모드의 프롬프트 KV 재사용은 옵트인이며 `scripts/serve.sh`로 시작하면
+  기본 켜짐입니다(`--dflash-prefix-cache`; 끄려면 `GLM53_PREFIX_CACHE=0`).
+  drafter 링에는 이전 요청의 스냅샷이 없으므로, 프리픽스 매니저가 target
+  recurrent checkpoint마다 최근 2048 drafter 토큰의 호스트 RAM 스냅샷을 짝지어
+  보관하고 캐시 히트에서 둘 다 복원합니다. 프리픽스 미스, checkpoint 불일치,
+  취소된 요청, 엔진 오류는 모두 cold 프리필로 폴백합니다.
+
+  검증 호스트 실측(temperature 0, seed 42, 1K/8K/32K 반복): 반복 1K 프롬프트의
+  첫 토큰 대기 1.50초 → 0.65초, 8K 대화 후속 질문 7.86초 → 1.11초(토큰 93.98%
+  재사용), 32K 후속 질문 28.49초 → 1.12초(98.42% 재사용). 호스트 스냅샷은
+  checkpoint당 CPU RAM 약 43MiB를 쓰고, GPU VRAM 사용량은 측정 노이즈 범위에서
+  변화 없음. 반복 입력의 greedy 출력은 cold 실행과 일치했지만, 8K/32K 실제
+  텍스트 후속 요청은 native GPU 비교에서 전체 재처리 기준 출력과 일부 달랐습니다.
+  결함 위치는 문서화만 하고 수정하지 않았으므로, 재사용 경로는 측정된 반복
+  케이스에서 검증된 것으로 보고 일반적인 무손실은 주장하지 않습니다.
+- warm 프리필 처리량과 재사용으로 얻는 시간 절약은 별개 지표입니다.
 
 ## 알려진 제한
 

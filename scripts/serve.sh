@@ -70,6 +70,12 @@ else
       -i "$DRAFT_BF16_DIR" -o "$DRAFT_EXL3_DIR"
   fi
   SPEC_ARGS=(-dm "$DRAFT_EXL3_DIR" -ndt 7)
+  # Previous-request prefix reuse (paired host snapshots of the 8K draft ring).
+  # Validated: 8K repeat first token 7.9s -> 1.1s, 32K repeat 28.5s -> 1.1s.
+  # Disable with GLM53_PREFIX_CACHE=0.
+  if [ "${GLM53_PREFIX_CACHE:-1}" != "0" ]; then
+    SPEC_ARGS+=(--dflash-prefix-cache)
+  fi
 fi
 
 case "$PROFILE" in

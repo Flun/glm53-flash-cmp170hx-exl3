@@ -70,8 +70,8 @@ def bounded_draft_cache(tokens=8192):
 
     The ring exceeds window (2048) + prefill chunk (2048) + draft block (8).
     Logical cache size still matches the target; only drafter physical storage is
-    bounded. One active sequence is required. Prompt reuse is disabled because
-    target cached prefixes do not carry snapshots of this independent draft ring.
+    bounded. One active sequence is required. By default prompts run cold. The
+    opt-in prefix manager pairs target checkpoints with snapshots of this ring.
     """
     import inspect
     import torch
@@ -146,14 +146,24 @@ def bounded_draft_cache(tokens=8192):
     original_enqueue = Generator.enqueue
 
     def enqueue(self, job):
+        manager = None
         if self.dflash_draft and getattr(self.draft_cache, "dflash_ring_tokens", None):
             if self.num_remaining_jobs() or self.max_batch_size != 1 or isinstance(job, list):
                 raise ValueError("DFlash ring requires serialized single-sequence jobs")
             self.enable_defrag = False
-            self.pagetable.reset_page_table()
-            if self.recurrent_cache is not None:
-                self.recurrent_cache.prune_stranded()
-        return original_enqueue(self, job)
+            manager = getattr(self, "_glm_dflash_prefix_cache", None)
+            if manager is not None:
+                manager.begin(job)
+            else:
+                self.pagetable.reset_page_table()
+                if self.recurrent_cache is not None:
+                    self.recurrent_cache.prune_stranded()
+        try:
+            return original_enqueue(self, job)
+        except Exception:
+            if manager is not None:
+                manager.invalidate("enqueue_error")
+            raise
 
     Generator.enqueue = enqueue
     print(f"GLM DFlash2: {tokens}-token GPU draft ring; cold prompt prefill", flush=True)

@@ -19,6 +19,7 @@ English README (this file) · [한국어 README](README.ko.md)
 | GLM tool-call translation | `glm/glm_tools.py` | native XML tool calls → OpenAI `tool_calls` |
 | mHC fused decode kernels | `kernels/k_hcfuse.py` | 0xSero k_hcfuse, ExLlamaV3 1.5.4 compatible |
 | DFlash2 BF16 → EXL3 6bpw conversion | `dflash2/convert_drafter.py`, `dflash2/package_native.py` | 36 quantized linears, ~0.96 GiB drafter |
+| Previous-request prefix reuse | `glm/glm_dflash_prefix.py` | opt-in cache-hit for repeated prompts, enabled by default via `serve.sh` |
 | Setup / serve launchers | `scripts/setup.sh`, `scripts/serve.sh` | auto-download from Hugging Face on first run |
 
 Not included (out of scope): the benchmark harness and raw measurement data
@@ -89,12 +90,14 @@ GPU 0 first; see `glm/glm_profile.py` for the validated values.
 - Reasoning is returned as `reasoning_content`, the answer as `content`
 - OpenAI `tools` / `tool_choice` / `role: tool` messages are supported
 - `GET /health` reports cache format, context, speculation mode, draft ring size
+  and prefix-cache stats (`prompt_cache`: hits/misses/restored tokens).
 - `GET /v1/models` reports the active context limit
 - Defaults: `reasoning_effort=high`, `temperature=1.0`, `top_p=0.95`,
   `max_tokens=32768`. One request runs at a time; the rest wait up to 120 s.
 - `timings` exposes ExLlamaV3-native `prompt_ms` / `predicted_ms` plus draft
-  accepted/rejected counts, so PP/TG/acceptance can be measured from the client
-  without trusting SSE arrival times.
+  accepted/rejected counts and `cached_tokens` (also in
+  `usage.prompt_tokens_details.cached_tokens`), so PP/TG/acceptance and cache
+  hits can be measured from the client without trusting SSE arrival times.
 
 ## How the memory budget works
 
@@ -149,9 +152,25 @@ Conversion uses synthetic-Hessian calibration only (DFlash2's
 - Q8 staging bounds packed-pool gather copies to 32K-token tiles and pins the
   quantized-append workspace to two fixed buffers per GPU, so repeated requests
   do not accumulate VRAM.
-- Prompt KV reuse is disabled in the DFlash2 mode: the drafter ring has no
-  snapshot of previous requests, so every request prefills from scratch. Warm
-  prefill throughput and the reuse-time saving are separate metrics.
+- Prompt KV reuse is opt-in in the DFlash2 mode and enabled by default when
+  launched through `scripts/serve.sh` (`--dflash-prefix-cache`; disable with
+  `GLM53_PREFIX_CACHE=0`). The drafter ring has no snapshot of previous
+  requests on its own, so the prefix manager pairs each target recurrent
+  checkpoint with a host-RAM snapshot of the last 2048 drafter tokens and
+  restores both on a cache hit. A prefix miss, a mismatched checkpoint, a
+  cancelled request or an engine error all fall back to cold prefill.
+
+  Measured on the validated host (temperature 0, seed 42, 1K/8K/32K repeats):
+  first-token latency for a repeated 1K prompt dropped 1.50 s → 0.65 s, an 8K
+  conversation follow-up 7.86 s → 1.11 s (93.98% tokens reused), and a 32K
+  follow-up 28.49 s → 1.12 s (98.42% reused). The host snapshot costs ~43 MiB
+  of CPU RAM per stored checkpoint; GPU VRAM usage was unchanged within
+  measurement noise. Greedy outputs for the repeated inputs matched the
+  cold-run outputs, but longer real-text follow-ups at 8K/32K did not fully
+  reproduce the full-reprocess outputs in the native GPU comparison, so the
+  defect is documented rather than fixed — treat the reuse path as validated
+  for the measured repeat cases, not as proven lossless in general.
+- Warm prefill throughput and the reuse-time saving are separate metrics.
 
 ## Known limitations
 
