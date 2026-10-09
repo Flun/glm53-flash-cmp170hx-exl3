@@ -32,6 +32,25 @@ from glm_paths import KERNELS_DIR, HCFUSE_ENV, HCFUSE_CHECK_ENV
 runtime = {}
 
 
+# The deployed ExLlamaV3 generator page size is fixed at 256 tokens.
+PREFILL_PAGE_SIZE = 256
+
+
+def prefill_chunk_size(args):
+    """Validate before model allocation; optionally cap serving only, not autosplit."""
+    load_chunk = args.chunk_size
+    cap = getattr(args, "prefill_chunk_size", None)
+    for name, value in (("--chunk_size", load_chunk), ("--prefill-chunk-size", cap)):
+        if value is None and name == "--prefill-chunk-size":
+            continue
+        if type(value) is not int or value <= 0 or value % PREFILL_PAGE_SIZE:
+            raise ValueError(f"{name} must be a positive multiple of {PREFILL_PAGE_SIZE}")
+    if cap is not None and cap > load_chunk:
+        raise ValueError("--prefill-chunk-size must not exceed --chunk_size")
+    return load_chunk if cap is None else cap
+
+
+
 class FunctionDefinition(BaseModel):
     model_config = ConfigDict(extra="allow")
     name: str = Field(min_length=1)
@@ -138,6 +157,7 @@ class ReasoningSplitter:
 async def lifespan(app):
     from exllamav3 import AsyncGenerator, GreedySampler, model_init
     args = runtime["args"]
+    serving_chunk_size = prefill_chunk_size(args)
     if getattr(args, "q8_staging", False):
         from glm_q8_staging import install
         install()
@@ -177,7 +197,7 @@ async def lifespan(app):
         model=model, cache=cache, tokenizer=tokenizer, sampler=GreedySampler(),
         draft_model=draft_model, draft_cache=draft_cache,
         num_draft_tokens=args.num_draft_tokens, max_batch_size=1,
-        max_chunk_size=2048, recurrent_checkpoint_interval=2048)
+        max_chunk_size=serving_chunk_size, recurrent_checkpoint_interval=2048)
     if dflash and getattr(args, "dflash_prefix_cache", False):
         from glm_dflash_prefix import enable_prefix_cache
         enable_prefix_cache(runtime["generator"].generator)
@@ -228,6 +248,10 @@ async def health():
     prefix_cache = getattr(generator, "_glm_dflash_prefix_cache", None)
     return {"status": "ok", "engine": "ExLlamaV3", "model": MODEL_ID, "context_length": runtime["context_length"],
             "cache_tokens": runtime["args"].cache_size,
+            "max_chunk_size": generator.max_chunk_size,
+            "load_chunk_size": runtime["args"].chunk_size,
+            "prefill_chunk_cap": getattr(runtime["args"], "prefill_chunk_size", None),
+            "recurrent_checkpoint_interval": generator.recurrent_checkpoint_interval,
             "cache_format": cache_format(),
             "q8_staging": getattr(runtime["args"], "q8_staging", False),
             "draft_cache_format": ("FP16" if getattr(runtime["args"], "fp16_draft_cache", False)
@@ -472,6 +496,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     model_init.add_args(parser, cache=True, add_draft_model_args=True, default_chunk_size=2048)
     parser.add_argument("--port", type=int, default=PORT)
+    parser.add_argument("--prefill-chunk-size", type=int,
+                        default=os.environ.get("GLM53_PREFILL_CHUNK_SIZE"),
+                        help="Cap serving prefill chunks independently of loader/autosplit --chunk_size "
+                             "(default: GLM53_PREFILL_CHUNK_SIZE when set)")
     parser.add_argument("--q8-staging", action="store_true",
                         help="Bound packed-pool staging copies for the Q8 profile")
     parser.add_argument("--q8-head-gpu0", action="store_true",
@@ -481,6 +509,10 @@ if __name__ == "__main__":
     parser.add_argument("--dflash-prefix-cache", action="store_true",
                         help="Opt in to previous-request DFlash prefix reuse with paired host snapshots")
     args = parser.parse_args()
+    try:
+        prefill_chunk_size(args)
+    except ValueError as error:
+        parser.error(str(error))
     if not ((args.mtp and not args.draft_model_dir and args.num_draft_tokens == 2)
             or (not args.mtp and args.draft_model_dir and args.num_draft_tokens == 7)):
         parser.error("Use either --mtp -ndt 2 or -dm <DFlash2 EXL3 6bpw> -ndt 7")
