@@ -99,6 +99,10 @@ GPU 0 first; see `glm/glm_profile.py` for the validated values.
   `usage.prompt_tokens_details.cached_tokens`), so PP/TG/acceptance and cache
   hits can be measured from the client without trusting SSE arrival times.
 
+Prefill chunks follow the loader `--chunk_size` by default. An optional
+`--prefill-chunk-size` or `GLM53_PREFILL_CHUNK_SIZE` cap changes serving chunks
+without changing loader placement; see [prefill controls](docs/prefill_chunk.md).
+
 ## How the memory budget works
 
 The 384K Q8 profile is the largest layout that fits on 2× 64 GB with this
